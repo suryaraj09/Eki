@@ -1,36 +1,22 @@
 const API_TIMEOUT_MS = 10_000;
 
-/** Route-geometry saves issue two Google routing calls plus a Firestore write. */
-export const ROUTE_SAVE_TIMEOUT_MS = 30_000;
-
-export type ApiRequestPhase =
-  | "validation"
-  | "routing"
-  | "persistence"
-  | "timeout";
-
-/**
- * Typed API error carrying the failure phase so callers (especially the route
- * editor) can render a distinct, truthful message per cause (#149 p9).
- */
-export class ApiRequestError extends Error {
-  readonly phase?: ApiRequestPhase;
-  readonly status?: number;
-  readonly code?: string;
-
-  constructor(message: string, options: { phase?: ApiRequestPhase; status?: number; code?: string } = {}) {
-    super(message);
-    this.name = "ApiRequestError";
-    this.phase = options.phase;
-    this.status = options.status;
-    this.code = options.code;
-  }
-}
-
 type ApiRequestOptions = RequestInit & {
   fallbackError?: string;
   timeoutMs?: number;
 };
+
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly code: string,
+    readonly status: number | null,
+    readonly phase?: string,
+    readonly outcomeUnknown = false,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
 
 function configuredBackendUrl(): string {
   const configured = process.env.NEXT_PUBLIC_BACKEND_URL;
@@ -54,9 +40,21 @@ function configuredBackendUrl(): string {
 
 export async function apiRequest<T>(
   path: string,
-  { fallbackError = "Request failed.", timeoutMs = API_TIMEOUT_MS, signal, ...init }: ApiRequestOptions = {},
+  {
+    fallbackError = "Request failed.",
+    signal,
+    timeoutMs = API_TIMEOUT_MS,
+    ...init
+  }: ApiRequestOptions = {},
 ): Promise<T> {
   const backendUrl = configuredBackendUrl();
+  const headers = new Headers(init.headers);
+  const hostname = new URL(backendUrl).hostname;
+  // ngrok serves browser interstitials without API CORS headers unless this
+  // documented programmatic-request header is present on its free endpoints.
+  if ([".ngrok-free.dev", ".ngrok-free.app", ".ngrok.io"].some(suffix => hostname.endsWith(suffix))) {
+    headers.set("ngrok-skip-browser-warning", "1");
+  }
 
   const requestController = new AbortController();
   let abortSource: "caller" | "timeout" | null = null;
@@ -76,31 +74,47 @@ export async function apiRequest<T>(
   try {
     const response = await fetch(`${backendUrl}${path}`, {
       ...init,
+      headers,
       signal: requestController.signal,
     });
     if (response.status === 204) return undefined as T;
-    let result: T & { error?: unknown; phase?: unknown; code?: unknown };
+    let result: T & { error?: unknown; code?: unknown; phase?: unknown };
     try {
-      result = await response.json() as T & { error?: unknown; phase?: unknown; code?: unknown };
+      result = await response.json() as T & { error?: unknown };
     } catch (error) {
       if (response.ok) throw error;
-      result = {} as T & { error?: string; phase?: unknown; code?: unknown };
+      result = {} as T & { error?: string };
     }
     if (!response.ok) {
       const message = typeof result.error === "string" && result.error.trim()
         ? result.error
         : `${fallbackError} (HTTP ${response.status})`;
-      const phase =
-        result.phase === "validation" || result.phase === "routing" || result.phase === "persistence"
-          ? result.phase
-          : undefined;
-      const code = typeof result.code === "string" && result.code ? result.code : undefined;
-      throw new ApiRequestError(message, { phase, status: response.status, code });
+      throw new ApiError(
+        message,
+        typeof result.code === "string" ? result.code : "HTTP_ERROR",
+        response.status,
+        typeof result.phase === "string" ? result.phase : undefined,
+      );
     }
     return result;
   } catch (error) {
     if (abortSource === "timeout") {
-      throw new ApiRequestError("The request timed out. Please try again.", { phase: "timeout" });
+      throw new ApiError(
+        "The request timed out. The operation may still complete; retry to reconcile it.",
+        "NETWORK_TIMEOUT",
+        null,
+        "network",
+        true,
+      );
+    }
+    if (error instanceof TypeError) {
+      throw new ApiError(
+        "The backend could not be reached. Check the connection and retry.",
+        "BACKEND_UNAVAILABLE",
+        null,
+        "network",
+        true,
+      );
     }
     throw error;
   } finally {

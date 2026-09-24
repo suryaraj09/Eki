@@ -37,7 +37,11 @@ export async function requireAdmin(req: Request, res: Response, next: NextFuncti
 
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
     recordAuthAttempt("missing");
-    res.status(401).json({ error: "Missing or malformed Authorization header." });
+    res.status(401).json({
+      error: "Missing or malformed Authorization header.",
+      code: "AUTH_REQUIRED",
+      phase: "authentication",
+    });
     return;
   }
 
@@ -49,7 +53,11 @@ export async function requireAdmin(req: Request, res: Response, next: NextFuncti
     // Check for admin custom claim
     if (!decoded.admin) {
       recordAuthAttempt("denied");
-      res.status(403).json({ error: "Forbidden: Admin access required." });
+      res.status(403).json({
+        error: "Forbidden: Admin access required.",
+        code: "ADMIN_REQUIRED",
+        phase: "authentication",
+      });
       return;
     }
 
@@ -61,7 +69,11 @@ export async function requireAdmin(req: Request, res: Response, next: NextFuncti
     if (error instanceof AuthVerificationCapacityError) {
       recordAuthAttempt("capacity");
       res.set("Retry-After", "1");
-      res.status(503).json({ error: "Authentication service is busy. Retry shortly." });
+      res.status(503).json({
+        error: "Authentication service is busy. Retry shortly.",
+        code: "AUTH_BUSY",
+        phase: "authentication",
+      });
       return;
     }
     const code = authErrorCode(error);
@@ -71,7 +83,13 @@ export async function requireAdmin(req: Request, res: Response, next: NextFuncti
         code: code ?? "unknown",
         message: error instanceof Error ? error.message : "Non-Error thrown",
       });
-    } else recordAuthAttempt("denied");
-    res.status(401).json({ error: "Invalid or expired token." });
+    } else {
+      recordAuthAttempt("denied");
+    }
+    res.status(401).json({
+      error: "Invalid or expired token.",
+      code: "AUTH_INVALID",
+      phase: "authentication",
+    });
   }
 }

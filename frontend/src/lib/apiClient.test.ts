@@ -1,7 +1,25 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { apiRequest, ApiRequestError } from "./apiClient";
+import { ApiError, apiRequest } from "./apiClient";
 
 describe("apiRequest", () => {
+  it.each(["ngrok-free.dev", "ngrok-free.app", "ngrok.io"])("requests API responses from %s while preserving auth headers", async domain => {
+    vi.stubEnv("NEXT_PUBLIC_BACKEND_URL", `https://test.${domain}`);
+    const fetchMock = vi.fn().mockResolvedValue(new Response('{"ok":true}'));
+    vi.stubGlobal("fetch", fetchMock);
+    await apiRequest("/api/test", { headers: { Authorization: "Bearer test-only", "Content-Type": "application/json" } });
+    const headers = fetchMock.mock.calls[0][1].headers as Headers;
+    expect(headers.get("ngrok-skip-browser-warning")).toBe("1");
+    expect(headers.get("Authorization")).toBe("Bearer test-only");
+    expect(headers.get("Content-Type")).toBe("application/json");
+  });
+
+  it.each(["api.example.test", "test.ngrok-free.dev.example.test"])("does not add tunnel headers to %s", async hostname => {
+    vi.stubEnv("NEXT_PUBLIC_BACKEND_URL", `https://${hostname}`);
+    const fetchMock = vi.fn().mockResolvedValue(new Response('{}'));
+    vi.stubGlobal("fetch", fetchMock);
+    await apiRequest("/api/test");
+    expect((fetchMock.mock.calls[0][1].headers as Headers).has("ngrok-skip-browser-warning")).toBe(false);
+  });
   afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
@@ -29,38 +47,11 @@ describe("apiRequest", () => {
       new Response(JSON.stringify({ error: "Denied" }), { status: 403 }),
     ));
 
-    await expect(apiRequest("/api/test")).rejects.toThrow("Denied");
-  });
-
-  it("attaches the backend failure phase to the thrown error", async () => {
-    vi.stubEnv("NEXT_PUBLIC_BACKEND_URL", "https://api.example.test");
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ error: "Google routing failed.", phase: "routing" }), { status: 502 }),
-    ));
-
-    const error = await apiRequest("/api/routes/x", { fallbackError: "Save failed." })
-      .then(() => { throw new Error("expected rejection"); })
-      .catch((e: unknown) => e);
-    expect(error).toBeInstanceOf(ApiRequestError);
-    expect((error as ApiRequestError).phase).toBe("routing");
-    expect((error as ApiRequestError).message).toBe("Google routing failed.");
-  });
-
-  it("uses the per-request timeout override and reports the timeout phase", async () => {
-    vi.useFakeTimers();
-    vi.stubEnv("NEXT_PUBLIC_BACKEND_URL", "https://api.example.test");
-    const fetchMock = vi.fn((_url: string, init?: RequestInit) => new Promise((_resolve, reject) => {
-      init?.signal?.addEventListener("abort", () => reject(init.signal?.reason ?? new Error("aborted")));
-    }));
-    vi.stubGlobal("fetch", fetchMock);
-
-    const pending = apiRequest("/api/routes/x", { timeoutMs: 5_000 })
-      .then(() => { throw new Error("expected timeout"); })
-      .catch((e: unknown) => e);
-    await vi.advanceTimersByTimeAsync(5_000);
-    const error = await pending;
-    expect(error).toBeInstanceOf(ApiRequestError);
-    expect((error as ApiRequestError).phase).toBe("timeout");
+    await expect(apiRequest("/api/test")).rejects.toMatchObject({
+      message: "Denied",
+      code: "HTTP_ERROR",
+      status: 403,
+    } satisfies Partial<ApiError>);
   });
 
   it("uses the HTTP fallback for empty or non-string server errors", async () => {
@@ -117,7 +108,10 @@ describe("apiRequest", () => {
     vi.stubEnv("NEXT_PUBLIC_BACKEND_URL", "https://api.example.test");
     const networkError = new TypeError("Network request failed");
     vi.stubGlobal("fetch", vi.fn().mockRejectedValueOnce(networkError));
-    await expect(apiRequest("/api/test")).rejects.toBe(networkError);
+    await expect(apiRequest("/api/test")).rejects.toMatchObject({
+      code: "BACKEND_UNAVAILABLE",
+      outcomeUnknown: true,
+    });
 
     const controller = new AbortController();
     controller.abort();

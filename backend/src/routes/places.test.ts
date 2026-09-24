@@ -1,109 +1,136 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import type { Server } from "node:http";
+import express from "express";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+
+const access = vi.hoisted(() => ({ role: "admin" as "admin" | "user" | "none" }));
+
+vi.mock("../middleware/requireAdmin", () => ({
+  requireAdmin: (_req: unknown, res: express.Response, next: () => void) => {
+    if (access.role === "none") {
+      res.status(401).json({ error: "Authentication required.", code: "AUTH_REQUIRED" });
+    } else if (access.role !== "admin") {
+      res.status(403).json({ error: "Administrator access required.", code: "ADMIN_REQUIRED" });
+    } else {
+      next();
+    }
+  },
+}));
+
 import placesRouter from "./places";
 
-function mountHandler() {
-  const layer = (placesRouter.stack as unknown[]).find(
-    (entry: { route?: { path?: string } }) => entry?.route?.path === "/search",
-  );
-  const route = (layer as { route: { stack: Array<{ handle: (...args: unknown[]) => unknown }> } }).route;
-  const handle = route.stack[route.stack.length - 1].handle;
-  return handle as (req: { query: Record<string, unknown> }, res: Res) => Promise<void>;
+let server: Server;
+let baseUrl = "";
+const networkFetch = globalThis.fetch;
+
+beforeAll(async () => {
+  const app = express();
+  app.use("/api/places", placesRouter);
+  server = await new Promise<Server>((resolve) => {
+    const listener = app.listen(0, "127.0.0.1", () => resolve(listener));
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("Test server did not bind.");
+  baseUrl = `http://127.0.0.1:${address.port}`;
+});
+
+afterAll(async () => {
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => error ? reject(error) : resolve());
+  });
+});
+
+beforeEach(() => {
+  access.role = "admin";
+  process.env.GOOGLE_MAPS_API_KEY = "test-key";
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+
+function mockUpstream(response: Response | ((init: RequestInit) => Promise<Response>)) {
+  vi.stubGlobal("fetch", vi.fn((input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    if (url.startsWith(baseUrl)) return networkFetch(input, init);
+    return typeof response === "function" ? response(init ?? {}) : Promise.resolve(response);
+  }));
 }
 
-interface Res {
-  statusCode: number;
-  body: Record<string, unknown>;
+async function search(query = "university") {
+  return networkFetch(`${baseUrl}/api/places/search?q=${encodeURIComponent(query)}`);
 }
 
-function mockRes(): Res & { status(code: number): unknown; json(body: unknown): unknown } {
-  const res = {
-    statusCode: 200,
-    body: {} as Record<string, unknown>,
-    status(code: number) {
-      (this as { statusCode: number }).statusCode = code;
-      return this;
-    },
-    json(body: unknown) {
-      (this as { body: Record<string, unknown> }).body = body as Record<string, unknown>;
-      return this;
-    },
-  };
-  return res;
-}
-
-describe("GET /api/places/search (integration, mocked upstream)", () => {
-  afterEach(() => {
-    vi.unstubAllGlobals();
-    vi.unstubAllEnvs();
-    vi.useRealTimers();
+describe("place search route", () => {
+  it("keeps unauthenticated and non-admin callers denied", async () => {
+    access.role = "none";
+    expect((await search()).status).toBe(401);
+    access.role = "user";
+    expect((await search()).status).toBe(403);
   });
 
-  it("rejects a too-short query as invalid_query", async () => {
-    vi.unstubAllEnvs();
-    const handler = mountHandler();
-    const res = mockRes();
-    await handler({ query: { q: "ab" } }, res as never);
-    expect(res.statusCode).toBe(400);
-    expect(res.body.code).toBe("invalid_query");
+  it("returns validated place results and a genuine empty result", async () => {
+    mockUpstream(new Response(JSON.stringify({
+      places: [{
+        displayName: { text: "Campus" },
+        formattedAddress: "University Road",
+        location: { latitude: 23.03, longitude: 72.55 },
+      }],
+    }), { status: 200 }));
+    const success = await search("campus unique");
+    expect(success.status).toBe(200);
+    await expect(success.json()).resolves.toEqual({
+      results: [{ name: "Campus", address: "University Road", lat: 23.03, lng: 72.55 }],
+    });
+
+    mockUpstream(new Response(JSON.stringify({ places: [] }), { status: 200 }));
+    const empty = await search("empty unique");
+    expect(empty.status).toBe(200);
+    await expect(empty.json()).resolves.toEqual({ results: [] });
   });
 
-  it("returns not_configured when the Places API key is missing", async () => {
-    vi.stubEnv("GOOGLE_MAPS_API_KEY", "");
-    const handler = mountHandler();
-    const res = mockRes();
-    await handler({ query: { q: "campus gate" } }, res as never);
-    expect(res.statusCode).toBe(503);
-    expect(res.body.code).toBe("not_configured");
+  it("returns structured validation and configuration errors", async () => {
+    const invalid = await search("x");
+    expect(invalid.status).toBe(400);
+    await expect(invalid.json()).resolves.toMatchObject({ code: "INVALID_PLACE_QUERY" });
+
+    delete process.env.GOOGLE_MAPS_API_KEY;
+    const missing = await search("missing config unique");
+    expect(missing.status).toBe(503);
+    await expect(missing.json()).resolves.toMatchObject({ code: "PLACES_NOT_CONFIGURED" });
   });
 
-  it("returns upstream_error when the Places API responds non-ok", async () => {
-    vi.stubEnv("GOOGLE_MAPS_API_KEY", "test-key");
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
-      new Response("denied", { status: 403 }),
-    ));
-    const handler = mountHandler();
-    const res = mockRes();
-    await handler({ query: { q: "campus gate" } }, res as never);
-    expect(res.statusCode).toBe(502);
-    expect(res.body.code).toBe("upstream_error");
+  it("distinguishes upstream rate limiting from other failures", async () => {
+    mockUpstream(new Response("quota", { status: 429 }));
+    const limited = await search("rate limited unique");
+    expect(limited.status).toBe(503);
+    await expect(limited.json()).resolves.toMatchObject({ code: "PLACES_UPSTREAM_RATE_LIMITED" });
+
+    mockUpstream(new Response("bad gateway", { status: 500 }));
+    const failed = await search("upstream failure unique");
+    expect(failed.status).toBe(502);
+    await expect(failed.json()).resolves.toMatchObject({ code: "PLACES_UPSTREAM_FAILURE" });
   });
 
-  it("returns upstream_timeout when the upstream call aborts", async () => {
+  it("keeps the timeout active while parsing the upstream response body", async () => {
     vi.useFakeTimers();
-    vi.stubEnv("GOOGLE_MAPS_API_KEY", "test-key");
-    vi.stubGlobal("fetch", vi.fn((_url: string, init?: RequestInit) => new Promise((_res, reject) => {
-      init?.signal?.addEventListener("abort", () =>
-        reject(init.signal?.reason ?? new DOMException("aborted", "AbortError")),
-      );
-    })));
+    let bodyStarted!: () => void;
+    const started = new Promise<void>((resolve) => { bodyStarted = resolve; });
+    mockUpstream(async (init) => ({
+      ok: true,
+      status: 200,
+      json: () => new Promise((_resolve, reject) => {
+        bodyStarted();
+        init.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+      }),
+    } as Response));
 
-    const handler = mountHandler();
-    const res = mockRes();
-    const pending = handler({ query: { q: "campus gate" } }, res as never);
+    const result = search("slow body unique");
+    await started;
     await vi.advanceTimersByTimeAsync(5_000);
-    await pending;
-    expect(res.statusCode).toBe(504);
-    expect(res.body.code).toBe("upstream_timeout");
-  });
-
-  it("returns mapped results and a count on success", async () => {
-    vi.stubEnv("GOOGLE_MAPS_API_KEY", "test-key");
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({
-        places: [
-          {
-            displayName: { text: "Ahmedabad University" },
-            formattedAddress: "110, Ahmedabad",
-            location: { latitude: 23.03, longitude: 72.55 },
-          },
-        ],
-      }), { status: 200 }),
-    ));
-    const handler = mountHandler();
-    const res = mockRes();
-    await handler({ query: { q: "ahmedabad university" } }, res as never);
-    expect(res.statusCode).toBe(200);
-    expect(res.body.count).toBe(1);
-    expect((res.body.results as Array<{ name: string }>)[0].name).toBe("Ahmedabad University");
+    const response = await result;
+    expect(response.status).toBe(504);
+    await expect(response.json()).resolves.toMatchObject({ code: "PLACES_TIMEOUT" });
   });
 });
