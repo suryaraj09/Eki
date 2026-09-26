@@ -20,6 +20,17 @@ export function isTelemetryEnabled(env: NodeJS.ProcessEnv = process.env): boolea
   return env.OTEL_SDK_DISABLED?.trim().toLowerCase() !== "true" && hasOtlpEndpoint(env);
 }
 
+/** Removes request URL values that can contain user searches or identifiers. */
+export function redactHttpSpanUrl(
+  setAttribute: (key: string, value: string) => unknown,
+): void {
+  setAttribute("http.target", "/[redacted]");
+  setAttribute("http.url", "[redacted]");
+  setAttribute("url.full", "[redacted]");
+  setAttribute("url.path", "/[redacted]");
+  setAttribute("url.query", "");
+}
+
 /** Starts before application modules load so HTTP/Express patches are effective. */
 export function startTelemetry(): boolean {
   if (sdk || !isTelemetryEnabled()) return Boolean(sdk);
@@ -51,6 +62,9 @@ export function startTelemetry(): boolean {
           // Keep load-balancer probes from drowning out actionable requests.
           ignoreIncomingRequestHook: request =>
             request.url?.split("?", 1)[0] === "/health",
+          // URLs can contain free-form place searches, user/device IDs, or
+          // other query values. Keep those out of exported HTTP spans.
+          requestHook: span => redactHttpSpanUrl((key, value) => span.setAttribute(key, value)),
         },
         "@opentelemetry/instrumentation-pino": {
           disableLogCorrelation: false,

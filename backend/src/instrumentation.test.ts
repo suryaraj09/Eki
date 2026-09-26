@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isTelemetryEnabled } from "./instrumentation";
+import { isTelemetryEnabled, redactHttpSpanUrl } from "./instrumentation";
 
 describe("OpenTelemetry configuration", () => {
   it("stays disabled when no OTLP endpoint is configured", () => {
@@ -19,5 +19,20 @@ describe("OpenTelemetry configuration", () => {
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://collector:4318",
       OTEL_SDK_DISABLED: " TRUE ",
     })).toBe(false);
+  });
+
+  it("redacts HTTP URL attributes before exporting spans", () => {
+    const attributes: Record<string, string> = {};
+    redactHttpSpanUrl((key, value) => {
+      attributes[key] = value;
+    });
+
+    expect(attributes).toEqual({
+      "http.target": "/[redacted]",
+      "http.url": "[redacted]",
+      "url.full": "[redacted]",
+      "url.path": "/[redacted]",
+      "url.query": "",
+    });
   });
 });
